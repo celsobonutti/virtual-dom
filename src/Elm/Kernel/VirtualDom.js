@@ -4,8 +4,8 @@ import Basics exposing (identity)
 import Elm.Kernel.Debug exposing (crash)
 import Elm.Kernel.Json exposing (equality, runHelp, unwrap, wrap)
 import Elm.Kernel.List exposing (Cons, Nil)
-import Elm.Kernel.Utils exposing (Tuple2)
-import Elm.Kernel.Platform exposing (export)
+import Elm.Kernel.Utils exposing (Tuple2, eq)
+import Elm.Kernel.Platform exposing (export, initialize, batch)
 import Json.Decode as Json exposing (map, map2, succeed)
 import Result exposing (isOk)
 import VirtualDom exposing (toHandlerInt)
@@ -222,6 +222,157 @@ var _VirtualDom_lazy8 = F9(function(func, a, b, c, d, e, f, g, h)
 		return A8(func, a, b, c, d, e, f, g, h);
 	});
 });
+
+
+
+// COMPONENT
+
+
+/**__PROD/
+var _VirtualDom_internalTag = 0;
+var _VirtualDom_emitTag = 1;
+//*/
+/**__DEBUG/
+var _VirtualDom_internalTag = 'Internal';
+var _VirtualDom_emitTag = 'Emit';
+//*/
+
+
+var _VirtualDom_PROPS_CHANGED = {};
+
+
+var _VirtualDom_component = F2(function(spec, props)
+{
+	return {
+		$: __2_COMPONENT,
+		__spec: spec,
+		__props: props,
+		__instance: null,
+		__descendantsCount: 0
+	};
+});
+
+
+function _VirtualDom_sendToParent(eventNode, msg, isSync)
+{
+	var currentNode = eventNode;
+	while (currentNode.__tagger)
+	{
+		if (typeof currentNode.__tagger == 'function')
+		{
+			msg = currentNode.__tagger(msg);
+		}
+		else
+		{
+			for (var i = currentNode.__tagger.length; i--; )
+			{
+				msg = currentNode.__tagger[i](msg);
+			}
+		}
+		currentNode = currentNode.__parent;
+	}
+	currentNode(msg, isSync);
+}
+
+
+function _VirtualDom_componentMount(vNode, eventNode)
+{
+	var spec = vNode.__spec;
+	var props = vNode.__props;
+
+	var instance = {
+		__spec: spec,
+		__props: props,
+		__domNode: null,
+		__currVNode: null,
+		__sendToApp: null,
+		__dispatcher: null,
+		__dead: false
+	};
+
+	// Dispatcher: acts as eventNode root for the component's subtree
+	instance.__dispatcher = function(componentMsg, isSync) {
+		if (instance.__dead) return;
+		if (componentMsg.$ === _VirtualDom_emitTag) {
+			// Emit: unwrap propMsg and forward to parent's eventNode
+			_VirtualDom_sendToParent(eventNode, componentMsg.a, isSync);
+		} else {
+			// Internal: send to component's own sendToApp
+			instance.__sendToApp(componentMsg, isSync);
+		}
+	};
+
+	// Wrapped update: routes Internal msgs to spec.update, PropsChanged to spec.onPropsChange
+	var wrappedUpdate = F2(function(msg, model) {
+		if (msg.$ === _VirtualDom_PROPS_CHANGED) {
+			instance.__props = msg.__new;
+			return A3(spec.__$onPropsChange, msg.__old, msg.__new, model);
+		}
+		if (msg.$ === _VirtualDom_emitTag) {
+			// Emit from Cmd (e.g. Browser.Component.emit) - forward to parent
+			_VirtualDom_sendToParent(eventNode, msg.a, false);
+			return __Utils_Tuple2(model, __Platform_batch(__List_Nil));
+		}
+		// Internal(innerMsg) - unwrap and call spec.update with current props
+		return A3(spec.__$update, msg.a, instance.__props, model);
+	});
+
+	// Wrapped subscriptions: passes current props
+	var wrappedSubs = function(model) {
+		return A2(spec.__$subscriptions, instance.__props, model);
+	};
+
+	// Use Platform.initialize to create the mini-runtime
+	__Platform_initialize(
+		__Json_succeed(props),
+		{},
+		spec.__$init,
+		wrappedUpdate,
+		wrappedSubs,
+		function(sendToApp, initialModel) {
+			instance.__sendToApp = sendToApp;
+
+			// Initial render
+			var view = spec.__$view;
+			instance.__currVNode = A2(view, instance.__props, initialModel);
+			instance.__domNode = _VirtualDom_render(instance.__currVNode, instance.__dispatcher);
+			instance.__domNode.__componentInstance = instance;
+
+			// Return stepper (synchronous re-render for POC)
+			return function(nextModel, isSync) {
+				if (instance.__dead) return;
+				var nextVNode = A2(view, instance.__props, nextModel);
+				var patches = _VirtualDom_diff(instance.__currVNode, nextVNode);
+				instance.__domNode = _VirtualDom_applyPatches(
+					instance.__domNode, instance.__currVNode, patches, instance.__dispatcher
+				);
+				instance.__currVNode = nextVNode;
+			};
+		}
+	);
+
+	vNode.__instance = instance;
+	return instance.__domNode;
+}
+
+
+function _VirtualDom_componentUpdateProps(instance, newProps)
+{
+	if (instance.__dead) return;
+	var oldProps = instance.__props;
+	if (__Utils_eq(oldProps, newProps)) return;
+	instance.__sendToApp({
+		$: _VirtualDom_PROPS_CHANGED,
+		__old: oldProps,
+		__new: newProps
+	}, false);
+}
+
+
+function _VirtualDom_componentUnmount(instance)
+{
+	instance.__dead = true;
+}
 
 
 
@@ -466,6 +617,11 @@ function _VirtualDom_render(vNode, eventNode)
 		var domNode = vNode.__render(vNode.__model);
 		_VirtualDom_applyFacts(domNode, eventNode, vNode.__facts);
 		return domNode;
+	}
+
+	if (tag === __2_COMPONENT)
+	{
+		return _VirtualDom_componentMount(vNode, eventNode);
 	}
 
 	// at this point `tag` must be __2_NODE or __2_KEYED_NODE
@@ -845,6 +1001,20 @@ function _VirtualDom_diffHelp(x, y, patches, index)
 			var patch = y.__diff(x.__model, y.__model);
 			patch && _VirtualDom_pushPatch(patches, __3_CUSTOM, index, patch);
 
+			return;
+
+		case __2_COMPONENT:
+			if (x.__spec !== y.__spec)
+			{
+				_VirtualDom_pushPatch(patches, __3_REDRAW, index, y);
+				return;
+			}
+			// Same spec: transfer instance, check props
+			y.__instance = x.__instance;
+			if (!__Utils_eq(x.__props, y.__props))
+			{
+				_VirtualDom_pushPatch(patches, __3_COMPONENT_UPDATE, index, y.__props);
+			}
 			return;
 	}
 }
@@ -1328,6 +1498,12 @@ function _VirtualDom_addDomNodesHelp(domNode, vNode, patches, i, low, high, even
 		return _VirtualDom_addDomNodesHelp(domNode, subNode, patches, i, low + 1, high, domNode.elm_event_node_ref);
 	}
 
+	if (tag === __2_COMPONENT)
+	{
+		// Component is a leaf in the parent's tree — no children to traverse
+		return i;
+	}
+
 	// tag must be __2_NODE or __2_KEYED_NODE at this point
 
 	var vKids = vNode.__kids;
@@ -1450,6 +1626,14 @@ function _VirtualDom_applyPatch(domNode, patch)
 		case __3_CUSTOM:
 			return patch.__data(domNode);
 
+		case __3_COMPONENT_UPDATE:
+			var instance = domNode.__componentInstance;
+			if (instance)
+			{
+				_VirtualDom_componentUpdateProps(instance, patch.__data);
+			}
+			return domNode;
+
 		default:
 			__Debug_crash(10); // 'Ran into an unknown patch!'
 	}
@@ -1458,6 +1642,12 @@ function _VirtualDom_applyPatch(domNode, patch)
 
 function _VirtualDom_applyPatchRedraw(domNode, vNode, eventNode)
 {
+	// Unmount old component if being redrawn
+	if (domNode.__componentInstance)
+	{
+		_VirtualDom_componentUnmount(domNode.__componentInstance);
+	}
+
 	var parentNode = domNode.parentNode;
 	var newNode = _VirtualDom_render(vNode, eventNode);
 
