@@ -279,6 +279,7 @@ function _VirtualDom_componentMount(vNode, eventNode)
 {
 	var spec = vNode.__spec;
 	var props = vNode.__props;
+	var hasEffects = !!spec.__$setup;
 
 	var instance = {
 		__spec: spec,
@@ -287,7 +288,33 @@ function _VirtualDom_componentMount(vNode, eventNode)
 		__currVNode: null,
 		__sendToApp: null,
 		__dispatcher: null,
-		__dead: false
+		__dead: false,
+		__cmdHandlers: {},
+		__activeSubs: [],
+		__setupState: null,
+		__pendingCmds: null
+	};
+
+	// instance.on(name, callback) — register command handler (called by .elm.js setup)
+	instance.on = function(name, callback) {
+		instance.__cmdHandlers[name] = callback;
+	};
+
+	// instance.send(name, value) — dispatch subscription value to Elm (called by .elm.js)
+	instance.send = function(name, value) {
+		if (instance.__dead) return;
+		for (var i = 0; i < instance.__activeSubs.length; i++)
+		{
+			var sub = instance.__activeSubs[i];
+			if (sub.__name === name)
+			{
+				var result = __Json_runHelp(sub.__decoder, value);
+				if (__Result_isOk(result))
+				{
+					instance.__dispatcher({ $: _VirtualDom_internalTag, a: sub.__tagger(result.a) }, false);
+				}
+			}
+		}
 	};
 
 	// Dispatcher: acts as eventNode root for the component's subtree
@@ -322,13 +349,44 @@ function _VirtualDom_componentMount(vNode, eventNode)
 		return A2(spec.__$subscriptions, instance.__props, model);
 	};
 
+	// If component has co-located JS effects, wrap init/update/subs to intercept
+	// component-specific Cmd/Sub bags (type $:4) before they reach Platform
+	var initForPlatform = spec.__$init;
+	var updateForPlatform = wrappedUpdate;
+	var subsForPlatform = wrappedSubs;
+
+	if (hasEffects)
+	{
+		initForPlatform = function(props) {
+			var pair = spec.__$init(props);
+			var extracted = _VirtualDom_extractComponentEffects(pair.b);
+			// Queue component cmds — setup() hasn't been called yet
+			instance.__pendingCmds = extracted.__effects;
+			return __Utils_Tuple2(pair.a, extracted.__remaining);
+		};
+
+		updateForPlatform = F2(function(msg, model) {
+			var pair = A2(wrappedUpdate, msg, model);
+			var extracted = _VirtualDom_extractComponentEffects(pair.b);
+			_VirtualDom_dispatchComponentCmds(instance, extracted.__effects);
+			return __Utils_Tuple2(pair.a, extracted.__remaining);
+		});
+
+		subsForPlatform = function(model) {
+			var subBag = wrappedSubs(model);
+			var extracted = _VirtualDom_extractComponentEffects(subBag);
+			_VirtualDom_updateComponentSubs(instance, extracted.__effects);
+			return extracted.__remaining;
+		};
+	}
+
 	// Use Platform.initialize to create the mini-runtime
 	__Platform_initialize(
 		__Json_succeed(props),
 		{},
-		spec.__$init,
-		wrappedUpdate,
-		wrappedSubs,
+		initForPlatform,
+		updateForPlatform,
+		subsForPlatform,
 		function(sendToApp, initialModel) {
 			instance.__sendToApp = sendToApp;
 
@@ -337,6 +395,18 @@ function _VirtualDom_componentMount(vNode, eventNode)
 			instance.__currVNode = A2(view, instance.__props, initialModel);
 			instance.__domNode = _VirtualDom_render(instance.__currVNode, instance.__dispatcher);
 			instance.__domNode.__componentInstance = instance;
+
+			// Call setup after first render (if component has co-located JS effects)
+			if (hasEffects)
+			{
+				instance.__setupState = spec.__$setup(instance, instance.__domNode);
+				// Flush commands that were queued during init
+				if (instance.__pendingCmds)
+				{
+					_VirtualDom_dispatchComponentCmds(instance, instance.__pendingCmds);
+					instance.__pendingCmds = null;
+				}
+			}
 
 			// Return stepper (synchronous re-render for POC)
 			return function(nextModel, isSync) {
@@ -371,7 +441,93 @@ function _VirtualDom_componentUpdateProps(instance, newProps)
 
 function _VirtualDom_componentUnmount(instance)
 {
+	if (instance.__spec.__$teardown)
+	{
+		instance.__spec.__$teardown(instance, instance.__domNode, instance.__setupState);
+	}
 	instance.__dead = true;
+}
+
+
+// COMPONENT EFFECTS
+
+
+function _VirtualDom_componentCmd(name, encodedValue)
+{
+	return { $: 4, __name: name, __value: encodedValue };
+}
+
+
+function _VirtualDom_componentSub(name, decoder, tagger)
+{
+	return { $: 4, __name: name, __decoder: decoder, __tagger: tagger };
+}
+
+
+function _VirtualDom_extractComponentEffects(bag)
+{
+	var collected = [];
+	var remaining = _VirtualDom_filterBag(bag, collected);
+	return { __effects: collected, __remaining: remaining };
+}
+
+
+function _VirtualDom_filterBag(bag, collected)
+{
+	switch (bag.$)
+	{
+		case 4:
+			collected.push(bag);
+			return __Platform_batch(__List_Nil);
+
+		case 1:
+			return bag;
+
+		case 2:
+			var newList = __List_Nil;
+			for (var list = bag.m; list.b; list = list.b)
+			{
+				newList = __List_Cons(
+					_VirtualDom_filterBag(list.a, collected),
+					newList
+				);
+			}
+			return { $: 2, m: newList };
+
+		case 3:
+			var inner = [];
+			var innerRemaining = _VirtualDom_filterBag(bag.o, inner);
+			for (var i = 0; i < inner.length; i++)
+			{
+				collected.push(inner[i]);
+			}
+			return inner.length > 0
+				? { $: 3, n: bag.n, o: innerRemaining }
+				: bag;
+
+		default:
+			return bag;
+	}
+}
+
+
+function _VirtualDom_dispatchComponentCmds(instance, cmds)
+{
+	for (var i = 0; i < cmds.length; i++)
+	{
+		var cmd = cmds[i];
+		var handler = instance.__cmdHandlers[cmd.__name];
+		if (handler)
+		{
+			handler(__Json_unwrap(cmd.__value));
+		}
+	}
+}
+
+
+function _VirtualDom_updateComponentSubs(instance, subs)
+{
+	instance.__activeSubs = subs;
 }
 
 
